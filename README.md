@@ -45,5 +45,3 @@ npm run android
 - **expo-local-authentication** for Face ID / Touch ID
 - **Gluestack UI** for layout and components
 - **Finnhub API** for the news feed
-
-That’s it. If you hit any issues with iOS signing or device trust, check the notes in the `ios` folder.
