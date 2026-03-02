@@ -1,0 +1,103 @@
+require File.join(File.dirname(`node --print "require.resolve('expo/package.json')"`), "scripts/autolinking")
+require File.join(File.dirname(`node --print "require.resolve('react-native/package.json')"`), "scripts/react_native_pods")
+
+require 'json'
+podfile_properties = JSON.parse(File.read(File.join(__dir__, 'Podfile.properties.json'))) rescue {}
+
+def ccache_enabled?(podfile_properties)
+  # Environment variable takes precedence
+  return ENV['USE_CCACHE'] == '1' if ENV['USE_CCACHE']
+
+  # Fall back to Podfile properties
+  podfile_properties['apple.ccacheEnabled'] == 'true'
+end
+
+ENV['EX_DEV_CLIENT_NETWORK_INSPECTOR'] ||= podfile_properties['EX_DEV_CLIENT_NETWORK_INSPECTOR']
+ENV['RCT_USE_RN_DEP'] ||= '1' if podfile_properties['ios.buildReactNativeFromSource'] != 'true'
+ENV['RCT_USE_PREBUILT_RNCORE'] ||= '1' if podfile_properties['ios.buildReactNativeFromSource'] != 'true'
+ENV['RCT_HERMES_V1_ENABLED'] ||= '1' if podfile_properties['expo.useHermesV1'] == 'true'
+platform :ios, podfile_properties['ios.deploymentTarget'] || '15.1'
+
+prepare_react_native_project!
+
+target 'financedigest' do
+  use_expo_modules!
+
+  if ENV['EXPO_USE_COMMUNITY_AUTOLINKING'] == '1'
+    config_command = ['node', '-e', "process.argv=['', '', 'config'];require('@react-native-community/cli').run()"];
+  else
+    config_command = [
+      'node',
+      '--no-warnings',
+      '--eval',
+      'require(\'expo/bin/autolinking\')',
+      'expo-modules-autolinking',
+      'react-native-config',
+      '--json',
+      '--platform',
+      'ios'
+    ]
+  end
+
+  config = use_native_modules!(config_command)
+
+  use_frameworks! :linkage => podfile_properties['ios.useFrameworks'].to_sym if podfile_properties['ios.useFrameworks']
+  use_frameworks! :linkage => ENV['USE_FRAMEWORKS'].to_sym if ENV['USE_FRAMEWORKS']
+
+  use_react_native!(
+    :path => config[:reactNativePath],
+    :hermes_enabled => podfile_properties['expo.jsEngine'] == nil || podfile_properties['expo.jsEngine'] == 'hermes',
+    # An absolute path to your application root.
+    :app_path => "#{Pod::Config.instance.installation_root}/..",
+    :privacy_file_aggregation_enabled => podfile_properties['apple.privacyManifestAggregationEnabled'] != 'false',
+  )
+
+  post_install do |installer|
+    react_native_post_install(
+      installer,
+      config[:reactNativePath],
+      :mac_catalyst_enabled => false,
+      :ccache_enabled => ccache_enabled?(podfile_properties),
+    )
+
+    # Fix: RCT-Folly does not ship folly/coro headers; disable coroutines so Expected.h doesn't require them
+    installer.pods_project.targets.each do |target|
+      target.build_configurations.each do |config|
+        defs = config.build_settings['GCC_PREPROCESSOR_DEFINITIONS'] || ['$(inherited)']
+        defs = [defs] if defs.is_a?(String)
+        unless defs.include?('FOLLY_CFG_NO_COROUTINES=1')
+          config.build_settings['GCC_PREPROCESSOR_DEFINITIONS'] = defs + ['FOLLY_CFG_NO_COROUTINES=1']
+        end
+      end
+    end
+
+    # Fix: ExpoModulesCore — use Swift 5 to avoid Swift 6 concurrency errors (Xcode 16+) until expo-modules-core is updated
+    installer.pods_project.targets.each do |target|
+      if target.name.include?('ExpoModulesCore')
+        target.build_configurations.each do |config|
+          config.build_settings['SWIFT_VERSION'] = '5.0'
+          config.build_settings['SWIFT_STRICT_CONCURRENCY'] = 'off'
+        end
+      end
+    end
+
+    # Fix: Pods that use React-Fabric headers (e.g. RNSVG) need Yoga + ReactCodegen header paths
+    extra_header_paths = [
+      '"$(PODS_ROOT)/Headers/Public/Yoga"',
+      '"$(PODS_ROOT)/Headers/Private/Yoga"',
+      '"$(PODS_ROOT)/Headers/Public/ReactCodegen"',
+    ]
+    # When building RN from source, React-Core must see Yoga headers (yoga/YGNodeLayout.h etc.)
+    extra_header_paths << '"$(PODS_ROOT)/../node_modules/react-native/ReactCommon/yoga"'
+    installer.pods_project.targets.each do |target|
+      target.build_configurations.each do |config|
+        paths = config.build_settings['HEADER_SEARCH_PATHS'] || '$(inherited)'
+        paths = paths.is_a?(String) ? paths.split : paths
+        extra_header_paths.each do |path|
+          paths << path unless paths.include?(path)
+        end
+        config.build_settings['HEADER_SEARCH_PATHS'] = paths.join(' ')
+      end
+    end
+  end
+end
